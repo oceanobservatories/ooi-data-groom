@@ -39,7 +39,7 @@ def make_24h(df):
     :param df:
     :return:
     """
-    times = df.botsflu_time15s.values
+    times = df.time.values
     pressures = df.botsflu_meanpres.values
     time24h = prs_botsflu_time24h(times)
     data = {
