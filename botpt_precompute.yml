@@ -1,0 +1,13 @@
+postgres:
+  url: postgresql://awips@localhost/metadata
+
+cassandra:
+  contacts: 127.0.0.1
+  protocol_version: 3
+  keyspace: ooi
+
+plugin:
+  name: botpt_precompute
+  schedule:
+    trigger: cron
+    second: 0

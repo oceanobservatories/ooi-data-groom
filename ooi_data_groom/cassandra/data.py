@@ -8,10 +8,13 @@ from cassandra.concurrent import execute_concurrent_with_args
 
 from session import SessionManager
 
-NTP_OFFSET = (datetime.datetime(1970, 1, 1) - datetime.datetime(1900, 1, 1)).total_seconds()
+
+NTP_EPOCH = datetime.datetime(1900, 1, 1)
+UNIX_EPOCH = datetime.datetime(1970, 1, 1)
+NTP_OFFSET = (UNIX_EPOCH - NTP_EPOCH).total_seconds()
 
 
-log = logging.getLogger()
+log = logging.getLogger(__name__)
 
 
 def get_bin_number(timestamp, binsize):
@@ -29,9 +32,11 @@ def fetch_bin(subsite, node, sensor, method, stream, bin_number, cols, min_time=
 
     args = [subsite, node, sensor, method, bin_number]
     if min_time is not None:
+        min_time = (min_time - NTP_EPOCH).total_seconds()
         s += ' and time >= ?'
         args.append(min_time)
     if max_time is not None:
+        max_time = (max_time - NTP_EPOCH).total_seconds()
         s += ' and time < ?'
         args.append(max_time)
 

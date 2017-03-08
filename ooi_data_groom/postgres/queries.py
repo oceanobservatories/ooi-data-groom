@@ -67,7 +67,7 @@ def find_previous_bin(session, metadata_record, max_elapsed_seconds=None):
     if max_elapsed_seconds is None or previous_record is None:
         return previous_record
 
-    if metadata_record.first - previous_record.last < max_elapsed_seconds:
+    if (metadata_record.first - previous_record.last).total_seconds() < max_elapsed_seconds:
         return previous_record
 
 
@@ -87,7 +87,7 @@ def find_next_bin(session, metadata_record, max_elapsed_seconds=None):
     if max_elapsed_seconds is None or next_record is None:
         return next_record
 
-    if next_record.first - metadata_record.last < max_elapsed_seconds:
+    if (next_record.first - metadata_record.last).total_seconds() < max_elapsed_seconds:
         return next_record
 
 
@@ -182,7 +182,7 @@ def recreate_stream_metadata(session, subsite, node, sensor, method, stream):
                              PartitionMetadatum.stream == stream)
         result = query.first()
 
-        if result is None:
+        if result is None or not all(result):
             session.delete(sm)
         else:
             first, last, count = result

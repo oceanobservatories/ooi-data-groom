@@ -1,1 +1,1 @@
-from botpt_nano_fifteen import BotptNanoFifteenPlugin
+from botpt_plugin import BotptPlugin

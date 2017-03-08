@@ -2,6 +2,7 @@ import os
 import logging
 import logging.config
 
+import sys
 import yaml
 
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -9,7 +10,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from .cassandra.session import SessionManager
-from .plugins import PluginProvider
 
 
 log = logging.getLogger(__name__)
@@ -34,20 +34,41 @@ def setup_logging(default_path='logging.yml', default_level=logging.INFO, env_ke
 
 def main():
     setup_logging()
+    from .plugins import PluginProvider
+
+    if len(sys.argv) < 2:
+        log.error('Exiting! No configuration file provided.')
+        sys.exit(1)
+
+    config = yaml.load(open(sys.argv[1]))
+
+    postgres = config.get('postgres', {})
+    cassandra = config.get('cassandra', {})
+    plugin_config = config.get('plugin', {})
+
+    pg_url = postgres.get('url')
+    contacts = cassandra.get('contacts')
+    keyspace = cassandra.get('keyspace', 'ooi')
+    protocol_version = cassandra.get('protocol_version', 3)
+    if isinstance(contacts, basestring):
+        contacts = [contacts]
+    plugin_name = plugin_config.get('name')
+    schedule = plugin_config.get('schedule')
+
+    if not all((pg_url, contacts, plugin_name, schedule)):
+        log.error('Exiting! Invalid or incomplete configuration file.')
+        sys.exit(1)
+
     log.info('Creating database sessions')
 
-    connection_url = 'postgresql://awips@localhost:5432/metadata'
-    engine = create_engine(connection_url, echo=False)
-    # from ooi_data.postgres.model import MetadataBase
-    # MetadataBase.metadata.create_all(bind=engine)
+    engine = create_engine(pg_url, echo=False)
     Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    SessionManager.init(['localhost'], 'ooi')
+    SessionManager.init(contacts, keyspace, protocol_version=protocol_version)
 
     scheduler = BlockingScheduler()
+    plugin = PluginProvider.plugin_map.get(plugin_name)()
 
-    plugin = PluginProvider.plugin_map.get('botpt_nano_fifteen')()
-
-    scheduler.add_job(plugin.execute, trigger='cron', args=(Session,), minute=0)
+    scheduler.add_job(plugin.execute, args=(Session,), **schedule)
     scheduler.start()
 
 

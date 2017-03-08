@@ -31,7 +31,7 @@ handlers:
 
 loggers:
     ooi_data_groom:
-        level: ERROR
+        level: DEBUG
         handlers: [console]
         propagate: no
 
