@@ -17,9 +17,7 @@ from ooi_data_groom.postgres.queries import (find_bins_by_time, update_partition
                                              set_partition, recreate_stream_metadata, record_processing_metadata,
                                              find_modified_bins_by_jobname, find_previous_bin, find_next_bin)
 
-
 log = logging.getLogger(__name__)
-
 
 ION_VERSION = getattr(ion_functions, '__version__', 'unversioned')
 NTP_EPOCH = datetime.datetime(1900, 1, 1)
@@ -28,7 +26,8 @@ NTP_OFFSET = (UNIX_EPOCH - NTP_EPOCH).total_seconds()
 
 
 class BotptPrecompute(object):
-    def __init__(self, session, job_name, base_stream, output_stream, overlap_seconds, source_time, output_time, cols):
+    def __init__(self, session, job_name, base_stream, output_stream, overlap_seconds, source_time, output_time,
+                 cols, subsite=None, node=None, sensor=None, method=None):
         self.session = session
         self.overlap_seconds = overlap_seconds
         self.job_name = job_name
@@ -37,6 +36,10 @@ class BotptPrecompute(object):
         self.source_time = source_time
         self.output_time = output_time
         self.query_cols = cols
+        self.subsite = subsite
+        self.node = node
+        self.sensor = sensor
+        self.method = method
 
     def execute(self):
         log.info('Starting job: %s', self.job_name)
@@ -54,7 +57,12 @@ class BotptPrecompute(object):
         bins_to_process = set()
 
         log.info('Finding modified bins for job: %s', self.job_name)
-        for metadata_record in find_modified_bins_by_jobname(self.session, self.job_name, stream=self.base_stream):
+        for metadata_record in find_modified_bins_by_jobname(self.session, self.job_name,
+                                                             subsite=self.subsite,
+                                                             node=self.node,
+                                                             sensor=self.sensor,
+                                                             method=self.method,
+                                                             stream=self.base_stream):
             # If a botpt bin has been modified both it and the surrounding bins must be recalculated
             bins_to_process.add(metadata_record)
             next_record = find_next_bin(self.session, metadata_record, max_elapsed_seconds=self.overlap_seconds)
@@ -90,7 +98,7 @@ class BotptPrecompute(object):
         if next_bin is not None:
             next_dataframe = fetch_bin(next_bin.subsite, next_bin.node, next_bin.sensor,
                                        next_bin.method, next_bin.stream, next_bin.bin, self.query_cols,
-                                       max_time=metadata_record.last+datetime.timedelta(seconds=self.overlap_seconds))
+                                       max_time=metadata_record.last + datetime.timedelta(seconds=self.overlap_seconds))
             dataframes.append(next_dataframe)
 
         dataframe = pd.concat(dataframes).sort_values(self.source_time)
@@ -142,6 +150,8 @@ class BotptPrecompute(object):
 
         first_ntp = dataframe[self.output_time].min()
         last_ntp = dataframe[self.output_time].max()
+
+        # convert times to python datetime
         first = datetime.datetime.utcfromtimestamp(first_ntp - NTP_OFFSET)
         last = datetime.datetime.utcfromtimestamp(last_ntp - NTP_OFFSET)
 
@@ -167,6 +177,10 @@ class BotptPrecompute(object):
                 post_delete_first = remaining.time.min()
                 post_delete_last = remaining.time.max()
 
+                # convert times to python datetime
+                post_delete_first = datetime.datetime.utcfromtimestamp(post_delete_first - NTP_OFFSET)
+                post_delete_last = datetime.datetime.utcfromtimestamp(post_delete_last - NTP_OFFSET)
+
                 # update the partition metadata
                 set_partition(self.session, each.subsite, each.node, each.sensor, each.method, each.stream, each.store,
                               each.bin, post_delete_first, post_delete_last, post_delete_count)
@@ -185,6 +199,8 @@ class BotptPrecompute(object):
         for bin_number in results:
             first = results[bin_number]['first']
             last = results[bin_number]['last']
+
+            # convert times to python datetime
             first = datetime.datetime.utcfromtimestamp(first - NTP_OFFSET)
             last = datetime.datetime.utcfromtimestamp(last - NTP_OFFSET)
 
@@ -202,7 +218,7 @@ class BotptPrecompute(object):
 
 
 class BotptPrecompute15s(BotptPrecompute):
-    def __init__(self, session):
+    def __init__(self, session, **kwargs):
         base_stream = 'botpt_nano_sample'
         output_stream = 'botpt_nano_sample_15sec'
         job_name = 'botpt_precompute_15'
@@ -214,7 +230,7 @@ class BotptPrecompute15s(BotptPrecompute):
         cols = ['time', 'bottom_pressure', 'provenance']
 
         super(BotptPrecompute15s, self).__init__(session, job_name, base_stream, output_stream,
-                                                 overlap_seconds, source_time, output_time, cols)
+                                                 overlap_seconds, source_time, output_time, cols, **kwargs)
 
     @staticmethod
     def precompute(dataframe):
@@ -222,7 +238,7 @@ class BotptPrecompute15s(BotptPrecompute):
 
 
 class BotptPrecompute24h(BotptPrecompute):
-    def __init__(self, session):
+    def __init__(self, session, **kwargs):
         base_stream = 'botpt_nano_sample_15sec'
         output_stream = 'botpt_nano_sample_24hour'
         job_name = 'botpt_precompute_24'
@@ -234,7 +250,7 @@ class BotptPrecompute24h(BotptPrecompute):
         cols = ['time', 'botsflu_meanpres', 'provenance']
 
         super(BotptPrecompute24h, self).__init__(session, job_name, base_stream, output_stream,
-                                                 overlap_seconds, source_time, output_time, cols)
+                                                 overlap_seconds, source_time, output_time, cols, **kwargs)
 
     @staticmethod
     def precompute(dataframe):
@@ -244,9 +260,9 @@ class BotptPrecompute24h(BotptPrecompute):
 class BotptPlugin(PluginProvider):
     plugin_name = 'botpt_precompute'
 
-    def execute(self, sessionmaker):
+    def execute(self, sessionmaker, **kwargs):
         log.info('Executing plugin: %s', self.plugin_name)
         session = sessionmaker()
 
-        BotptPrecompute15s(session).execute()
-        BotptPrecompute24h(session).execute()
+        BotptPrecompute15s(session, **kwargs).execute()
+        BotptPrecompute24h(session, **kwargs).execute()

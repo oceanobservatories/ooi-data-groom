@@ -53,9 +53,10 @@ def main():
     if isinstance(contacts, basestring):
         contacts = [contacts]
     plugin_name = plugin_config.get('name')
-    schedule = plugin_config.get('schedule')
+    plugin_schedule = plugin_config.get('schedule')
+    plugin_kwargs = plugin_config.get('kwargs', {})
 
-    if not all((pg_url, contacts, plugin_name, schedule)):
+    if not all((pg_url, contacts, plugin_name, plugin_schedule)):
         log.error('Exiting! Invalid or incomplete configuration file.')
         sys.exit(1)
 
@@ -68,7 +69,7 @@ def main():
     scheduler = BlockingScheduler()
     plugin = PluginProvider.plugin_map.get(plugin_name)()
 
-    scheduler.add_job(plugin.execute, args=(Session,), **schedule)
+    scheduler.add_job(plugin.execute, args=(Session,), kwargs=plugin_kwargs, **plugin_schedule)
     scheduler.start()
 
 
