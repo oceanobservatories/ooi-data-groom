@@ -19,7 +19,7 @@ def make_15s(df):
     """
     times = df.time.values
     pressures = df.bottom_pressure.values
-    time15s = prs_botsflu_time15s(times)
+    time15s = prs_botsflu_time15s(times, pressures)
     data = {
         'time': time15s,
         'botsflu_time15s': time15s,

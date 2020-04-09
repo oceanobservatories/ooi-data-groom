@@ -17,4 +17,4 @@ for name in os.listdir(basedir):
             except StandardError:
                 import logging
                 logger = logging.getLogger(__name__)
-                logger.warning('Ignoring exception while loading the %r plug-in.', module)
+                logger.warning('Ignoring exception while loading the %s.%s plug-in.' % (__name__, module))
