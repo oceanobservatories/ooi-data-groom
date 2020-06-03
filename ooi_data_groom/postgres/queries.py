@@ -212,21 +212,23 @@ def update_stream_metadata(session, subsite, node, sensor, method, stream, first
 def get_processing_metadata(session, record_id, job_name):
     return session.query(ProcessedMetadatum).filter(
         ProcessedMetadatum.processor_name == job_name,
-        ProcessedMetadatum.partition_id == record_id
+        ProcessedMetadatum.partition_metadata_id == record_id
     ).first()
 
 
-def record_processing_metadata(session, record_id, job_name):
+def record_processing_metadata(session, record_id, job_name, success):
     with session.begin_nested():
         processed = get_processing_metadata(session, record_id, job_name)
 
         if processed is None:
             processed = ProcessedMetadatum(processor_name=job_name,
-                                           partition_id=record_id,
-                                           processed_time=func.now())
+                                           partition_metadata_id=record_idf,
+                                           processed_time=func.now(),
+                                           success=success)
             session.add(processed)
 
         else:
             processed.processed_time = func.now()
+            processed.success = success
 
     session.commit()

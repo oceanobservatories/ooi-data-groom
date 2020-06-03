@@ -1,0 +1,69 @@
+#!/bin/bash
+
+HERE=$(cd $(dirname $(readlink -f $BASH_SOURCE)) && pwd)
+
+PIDFILE="$HERE/$2_data_groom.pid"
+NAME="Data Groom $2"
+timestamp=`date +%F-%H-%M-%S`
+
+config=$HERE/$2.yml
+std_out_redir=$HERE/$2_std.out
+
+export LOG_CFG=$config
+export LOG_DIR=$HERE/logs
+
+for d in $HERE/ooi_data_groom/plugins/*; do
+  if [ -d "$d" ]; then
+    plugin_path=$plugin_path:$d
+  fi
+done
+export PYTHONPATH=$plugin_path
+
+start(){
+    echo "Starting $NAME..."
+    if [ -f $PIDFILE ]; then
+        # PIDFILE exists, but the corresponding process does not
+        if [ ! -f /proc/$(cat $PIDFILE)/status ]; then
+            rm $PIDFILE
+        fi
+    fi
+
+    if [ ! -f $PIDFILE ]; then
+        nohup python -m ooi_data_groom.runner $config >> $std_out_redir 2>&1 &
+        echo $! > $PIDFILE
+        disown
+    else
+        PIDNUM=$(cat $PIDFILE)
+        echo "$NAME: Trying to start, but pid ${PIDNUM} exists"
+    fi
+}
+
+stop(){
+    echo "Stopping $NAME..."
+    if [ -f $PIDFILE ]; then
+        kill $(<$PIDFILE)
+        rm $PIDFILE
+    else
+        echo "$NAME: Trying to stop data groom, but pid does not exist"
+        rm $PIDFILE
+    fi
+}
+
+case $1 in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    status)
+        [ -f $PIDFILE ] && echo "$NAME: "$(<$PIDFILE) || echo "$NAME:"
+        ;;
+    *)
+        echo "Usage: data-groom (start|stop|restart|status) (config_name)"
+        ;;
+esac
