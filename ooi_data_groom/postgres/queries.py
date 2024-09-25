@@ -222,7 +222,7 @@ def record_processing_metadata(session, record_id, job_name, success):
 
         if processed is None:
             processed = ProcessedMetadatum(processor_name=job_name,
-                                           partition_metadata_id=record_idf,
+                                           partition_metadata_id=record_id,
                                            processed_time=func.now(),
                                            success=success)
             session.add(processed)

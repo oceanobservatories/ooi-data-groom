@@ -11,7 +11,7 @@ from ooi_data.postgres.model import Stream
 
 from ooi_data_groom.cassandra.data import fetch_bin, insert_dataframe, delete_dataframe
 from ooi_data_groom.cassandra.provenance import insert_l0_provenance, fetch_l0_provenance, ProvTuple
-from ooi_data_groom.plugins.botpt.common import make_15s, make_24h
+from ooi_data_groom.plugins.botpt.common import make_15s, make_24h, ntp_to_datetime, DataNotFoundException
 from ooi_data_groom.plugins.manager import PluginProvider
 from ooi_data_groom.postgres.queries import (find_bins_by_time, update_partition, update_stream_metadata,
                                              set_partition, recreate_stream_metadata, record_processing_metadata,
@@ -23,6 +23,12 @@ ION_VERSION = getattr(ion_functions, '__version__', 'unversioned')
 NTP_EPOCH = datetime.datetime(1900, 1, 1)
 UNIX_EPOCH = datetime.datetime(1970, 1, 1)
 NTP_OFFSET = (UNIX_EPOCH - NTP_EPOCH).total_seconds()
+
+# The stream with predicted tide data
+PRED_TIDE_STREAM = 'instrument_predicted_tide'
+# Number of seconds to pad the tide data on either side on either side of the source stream dataset time range
+# to ensure that we cover the requested time range. Tide data is available in 15 second increments
+PRED_TIDE_TIME_RANGE_PAD = 15 * 4
 
 
 class BotptPrecompute(object):
@@ -54,6 +60,8 @@ class BotptPrecompute(object):
                     success = True
                 else:
                     log.info('No precompute records generated from base_stream bin: %r', metadata_record)
+            except DataNotFoundException as e:
+                log.exception(e)
             except KeyboardInterrupt:
                 break
             except StandardError:
@@ -116,7 +124,7 @@ class BotptPrecompute(object):
         if not dataframe.time.size:
             log.warning('No data found for bin: %r', metadata_record)
             return pd.DataFrame(), provenance
-        return self.trim_data_to_bin(self.precompute(dataframe), metadata_record), provenance
+        return self.trim_data_to_bin(self.precompute(dataframe, metadata_record), metadata_record), provenance
 
     def trim_data_to_bin(self, dataframe, metadata_record):
         last = (metadata_record.last - NTP_EPOCH).total_seconds()
@@ -145,7 +153,7 @@ class BotptPrecompute(object):
 
     def insert_precomputed_botpt_data(self, dataframe, metadata_record, computed_provenance):
         """
-        Delete any previously precomputed data matching this dataframe
+        Delete any previously precomputed data matching this dataframe that has since changed
         Insert new computed_provenance
         Insert new precomputed data
         :param dataframe:
@@ -320,9 +328,39 @@ class BotptPrecompute(object):
             update_stream_metadata(self.session, metadata_record.subsite, metadata_record.node, metadata_record.sensor,
                                    metadata_record.method, self.output_stream, first, last, count)
 
+    def get_predicted_tide(self, min_time, max_time, metadata_record):
+        min_dt = datetime.datetime.utcfromtimestamp(min_time - NTP_OFFSET)
+        max_dt = datetime.datetime.utcfromtimestamp(max_time - NTP_OFFSET)
+        arg_str = '%s, %s, %s, %s, %s, %s, %s (%d), %s (%d)' % \
+                  (metadata_record.subsite, metadata_record.node, metadata_record.sensor,
+                   metadata_record.method, PRED_TIDE_STREAM, metadata_record.store,
+                   min_dt, min_time, max_dt, max_time)
+        log.info('calling fetch_bins_by_time(%s)', arg_str)
+        partition_metadata_list = find_bins_by_time(self.session,
+                                                    metadata_record.subsite,
+                                                    metadata_record.node,
+                                                    metadata_record.sensor,
+                                                    metadata_record.method,
+                                                    PRED_TIDE_STREAM,
+                                                    metadata_record.store,
+                                                    min_dt, max_dt)
+        if not partition_metadata_list:
+            raise DataNotFoundException("partition_metadata not found for %s" % arg_str)
+        dataframes = []
+        for pm in partition_metadata_list:
+            df = fetch_bin(pm.subsite, pm.node, pm.sensor, pm.method, pm.stream, pm.bin, ('time', 'predicted_tide'),
+                                           min_time=min_dt, max_time=max_dt)
+            if not df.size:
+                log.warning('No %s data found for bin: %r', PRED_TIDE_STREAM, pm)
+                continue
+            dataframes.append(df)
+        if not dataframes:
+            raise DataNotFoundException("Cassandra data not found for %s" % arg_str)
+        dataframe = pd.concat(dataframes).sort_values(self.source_time)
+        return dataframe
 
     @staticmethod
-    def precompute(dataframe):
+    def precompute(dataframe, metadata_record):
         raise NotImplemented
 
 
@@ -344,9 +382,23 @@ class BotptPrecompute15s(BotptPrecompute):
                                                  overlap_seconds, source_time, output_time,
                                                  cols, output_stream_derived_cols, **kwargs)
 
-    @staticmethod
-    def precompute(dataframe):
-        return make_15s(dataframe)
+    def precompute(self, dataframe, metadata_record):
+        # Pull the tide data for a time range slightly larger the source dataframe
+        pred_tide_dataframe = self.get_predicted_tide(dataframe.time.min() - PRED_TIDE_TIME_RANGE_PAD,
+                                                      dataframe.time.max() + PRED_TIDE_TIME_RANGE_PAD,
+                                                      metadata_record)
+        try:
+            return make_15s(dataframe, pred_tide_dataframe)
+        except ValueError as e:
+            log.error("ValueError caught from make_15s: " 
+                      "dataframe-%s(min: %s (%d), max: %s (%d)), dataframe-%s(min: %s (%d), max: %s (%d))",
+                      metadata_record.stream,
+                      ntp_to_datetime(dataframe.time.min()), dataframe.time.min(),
+                      ntp_to_datetime(dataframe.time.max()), dataframe.time.max(),
+                      PRED_TIDE_STREAM,
+                      ntp_to_datetime(pred_tide_dataframe.time.min()), pred_tide_dataframe.time.min(),
+                      ntp_to_datetime(pred_tide_dataframe.time.max()), pred_tide_dataframe.time.max())
+            raise
 
 
 class BotptPrecompute24h(BotptPrecompute):
@@ -359,7 +411,7 @@ class BotptPrecompute24h(BotptPrecompute):
         overlap_seconds = 86400 * 7 * 8
         source_time = 'time'
         output_time = 'botsflu_time24h'
-        cols = ['time', 'botsflu_meanpres', 'provenance']
+        cols = ['time', 'botsflu_meandepth', 'provenance']
         output_stream_derived_cols = ['time', 'botsflu_daydepth',
                                       'botsflu_4wkrate', 'botsflu_8wkrate']
 
@@ -367,9 +419,16 @@ class BotptPrecompute24h(BotptPrecompute):
                                                  overlap_seconds, source_time, output_time,
                                                  cols, output_stream_derived_cols, **kwargs)
 
-    @staticmethod
-    def precompute(dataframe):
-        return make_24h(dataframe)
+    def precompute(self, dataframe, metadata_record):
+        try:
+            return make_24h(dataframe)
+        except ValueError as e:
+            log.error("ValueError caught from make_24h: " 
+                      "dataframe-%s(min: %s (%d), max: %s (%d))",
+                      metadata_record.stream,
+                      ntp_to_datetime(dataframe.time.min()), dataframe.time.min(),
+                      ntp_to_datetime(dataframe.time.max()), dataframe.time.max())
+            raise
 
 
 class BotptPlugin(PluginProvider):
