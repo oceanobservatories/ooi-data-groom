@@ -1,0 +1,59 @@
+postgres:
+  url: postgresql://awips@localhost/metadata
+
+cassandra:
+  contacts: 127.0.0.1
+  protocol_version: 4
+  keyspace: ooi
+
+plugin:
+  name: botpt_precompute
+  schedule:
+    trigger: cron
+    minute: 0,5,10,15,20,25,30,35,40,45,50,55
+  kwargs:
+    subsite: RS03INT2
+    node: MJ03D
+    sensor: 06-BOTPTA303
+
+
+version: 1
+disable_existing_loggers: False
+formatters:
+    simple:
+        format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+handlers:
+    console:
+        class: logging.StreamHandler
+        level: DEBUG
+        formatter: simple
+        stream: ext://sys.stdout
+
+    info_file_handler:
+        class: logging.handlers.RotatingFileHandler
+        level: INFO
+        formatter: simple
+        filename: logs/RS03INT2-MJ03D-06-BOTPTA303_botpt_precompute_info.log
+        maxBytes: 100000000 # 100MB
+        backupCount: 20
+        encoding: utf8
+
+    error_file_handler:
+        class: logging.handlers.RotatingFileHandler
+        level: ERROR
+        formatter: simple
+        filename: logs/RS03INT2-MJ03D-06-BOTPTA303_botpt_precompute_error.log
+        maxBytes: 100000000 # 100MB
+        backupCount: 20
+        encoding: utf8
+
+loggers:
+    ooi_data_groom:
+        level: INFO
+        handlers: [error_file_handler, info_file_handler]
+        propagate: no
+
+root:
+    level: INFO
+    handlers: [info_file_handler, error_file_handler]
