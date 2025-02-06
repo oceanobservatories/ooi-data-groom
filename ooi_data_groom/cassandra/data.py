@@ -42,7 +42,9 @@ def fetch_bin(subsite, node, sensor, method, stream, bin_number, cols, min_time=
 
     ps = SessionManager.prepare(s)
     result = SessionManager.execute_numpy(ps, args)
-    return pd.concat((pd.DataFrame(r, columns=cols) for r in result)).sort_values('time')
+    df = pd.concat((pd.DataFrame(r, columns=cols) for r in result)).sort_values('time')
+    df.index = np.arange(len(df))
+    return df
 
 
 def insert_dataframe(subsite, node, sensor, method, stream, deployment, binsize, dataframe):
@@ -56,7 +58,7 @@ def insert_dataframe(subsite, node, sensor, method, stream, deployment, binsize,
     data_cols = [col for col in dataframe.columns if col in metadata_cols]
     fixed_cols = ['subsite', 'node', 'sensor', 'method', 'deployment']
     fixed_values = "'%s', '%s', '%s', '%s', %d" % (subsite, node, sensor, method, deployment)
-    variable_cols = ['bin', 'id'] + data_cols
+    variable_cols = ['bin'] + data_cols
 
     statement = "INSERT INTO %s (%s, %s) VALUES (%s, %s)" % (
         stream, ','.join(fixed_cols), ','.join(variable_cols), fixed_values, ','.join(('?' for _ in variable_cols)))
@@ -64,8 +66,6 @@ def insert_dataframe(subsite, node, sensor, method, stream, deployment, binsize,
 
     # add bin number to dataframe
     dataframe['bin'] = [get_bin_number(t, binsize) for t in dataframe.time.values]
-    # add unique UUID to each row in dataframe
-    dataframe['id'] = [uuid.uuid4() for _ in dataframe.time.values]
 
     def values_generator(df_group):
         for index, row in df_group.iterrows():

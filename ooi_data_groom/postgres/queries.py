@@ -4,6 +4,10 @@ from sqlalchemy.orm import aliased
 
 from ooi_data.postgres.model import PartitionMetadatum, ProcessedMetadatum, StreamMetadatum
 
+import logging
+
+log = logging.getLogger(__name__)
+
 
 def find_modified_bins_by_jobname(session, job_name, subsite=None, node=None, sensor=None,
                                   method=None, stream=None):
@@ -45,8 +49,8 @@ def find_bins_by_time(session, subsite, node, sensor, method, stream, store, min
         PartitionMetadatum.method == method,
         PartitionMetadatum.stream == stream,
         PartitionMetadatum.store == store,
-        PartitionMetadatum.first < max_time,
-        PartitionMetadatum.last > min_time
+        PartitionMetadatum.first <= max_time,
+        PartitionMetadatum.last >= min_time
     )
     return query
 

@@ -2,6 +2,7 @@ import json
 import logging
 import uuid
 from operator import attrgetter
+from collections import namedtuple
 
 import datetime
 import ion_functions
@@ -9,7 +10,7 @@ import numpy as np
 import pandas as pd
 from ooi_data.postgres.model import Stream
 
-from ooi_data_groom.cassandra.data import fetch_bin, insert_dataframe, delete_dataframe
+from ooi_data_groom.cassandra.data import fetch_bin, insert_dataframe, delete_dataframe, get_bin_number
 from ooi_data_groom.cassandra.provenance import insert_l0_provenance, fetch_l0_provenance, ProvTuple
 from ooi_data_groom.plugins.botpt.common import make_15s, make_24h, ntp_to_datetime, DataNotFoundException
 from ooi_data_groom.plugins.manager import PluginProvider
@@ -75,7 +76,8 @@ class BotptPrecompute(object):
     def find_bins(self):
         bins_to_process = set()
 
-        log.info('Finding modified bins for job: %s', self.job_name)
+        log.info('Finding modified bins for %s-%s-%s for job: %s' %
+                 (self.subsite, self.node, self.sensor, self.job_name))
         for metadata_record in find_modified_bins_by_jobname(self.session, self.job_name,
                                                              subsite=self.subsite,
                                                              node=self.node,
@@ -106,6 +108,7 @@ class BotptPrecompute(object):
         dataframes = []
 
         if previous_bin is not None:
+            log.info("previous bin: %d" % previous_bin.bin)
             min_time = metadata_record.first - datetime.timedelta(seconds=self.overlap_seconds)
             previous_dataframe = fetch_bin(previous_bin.subsite, previous_bin.node, previous_bin.sensor,
                                            previous_bin.method, previous_bin.stream, previous_bin.bin, self.query_cols,
@@ -115,21 +118,35 @@ class BotptPrecompute(object):
         dataframes.append(dataframe)
 
         if next_bin is not None:
+            log.info("next bin: %d" % next_bin.bin)
             next_dataframe = fetch_bin(next_bin.subsite, next_bin.node, next_bin.sensor,
                                        next_bin.method, next_bin.stream, next_bin.bin, self.query_cols,
                                        max_time=metadata_record.last + datetime.timedelta(seconds=self.overlap_seconds))
             dataframes.append(next_dataframe)
 
         dataframe = pd.concat(dataframes).sort_values(self.source_time)
+        dataframe.index = np.arange(len(dataframe))
         if not dataframe.time.size:
             log.warning('No data found for bin: %r', metadata_record)
             return pd.DataFrame(), provenance
+        dataframe = self.prune_duplicate_times(dataframe)
         return self.trim_data_to_bin(self.precompute(dataframe, metadata_record), metadata_record), provenance
+
+    def prune_duplicate_times(self, dataframe):
+        orig_len = dataframe.time.size
+        mask = np.diff(np.insert(dataframe.time.values, 0, 0.0)) != 0
+        if not mask.all():
+            dataframe = dataframe[mask]
+            dataframe.index = np.arange(len(dataframe))
+        new_len = dataframe.time.size
+        log.info("Number of duplicate times removed from source data: %d" % (orig_len - new_len))
+        return dataframe
 
     def trim_data_to_bin(self, dataframe, metadata_record):
         last = (metadata_record.last - NTP_EPOCH).total_seconds()
         index = (dataframe[self.output_time] >= metadata_record.bin) & (dataframe[self.output_time] < last)
         trimmed_dataframe = dataframe[index]
+        trimmed_dataframe.index = np.arange(len(trimmed_dataframe))
         log.debug('trimming dataframe to bin bounds - starting size: %d final_size: %d',
                   dataframe[self.output_time].size, trimmed_dataframe[self.output_time].size)
         return trimmed_dataframe
@@ -161,155 +178,184 @@ class BotptPrecompute(object):
         :param computed_provenance:
         :return:
         """
+        log.info("insert_precomputed_botpt_data (metadata_record, computed_provenance): (%s, %s)" %
+                 (metadata_record, computed_provenance))
+
         # columns in common to both the 15sec and 24hour streams
-        cols = ['time', 'deployment', 'id']
+        cols = ['time', 'deployment', 'id', 'provenance']
         cols.extend([i for i in self.output_stream_derived_cols if i not in cols])
 
         store = 'cass'
         precomputed_binsize = self.session.query(Stream).filter(
             Stream.name == self.output_stream).first().binsize_minutes * 60
 
-        insert_l0_provenance(computed_provenance)
-        # assign provenance values to each data point
-        dataframe['provenance'] = [computed_provenance.id for _ in dataframe.time.values]
+        dataframe['id'] = [uuid.uuid4() for _ in dataframe.time.values]
 
         first_ntp = dataframe[self.output_time].min()
         last_ntp = dataframe[self.output_time].max()
 
         orig_dataframe_size = dataframe[self.output_time].size
 
-        log.info("new dataframe before data comparison: size (%d), min (%d), max(%d)",
-                 orig_dataframe_size, first_ntp, last_ntp)
-
         # convert times to python datetime
         first = datetime.datetime.utcfromtimestamp(first_ntp - NTP_OFFSET)
         last = datetime.datetime.utcfromtimestamp(last_ntp - NTP_OFFSET)
 
-        bins = find_bins_by_time(self.session, metadata_record.subsite, metadata_record.node, metadata_record.sensor,
-                                 metadata_record.method, self.output_stream, 'cass', first, last)
+        log.info("new dataframe before data comparison: size (%d), min (%f, %s), max(%f, %s)",
+                 orig_dataframe_size, first_ntp, str(first), last_ntp, str(last))
+
+        # get the existing bins in the precomputed stream (self.output_stream)
+        # look back bin_duration seconds to get the previous bin just to get the previous provenance
+        lookback_first = first - datetime.timedelta(seconds=precomputed_binsize)
+        existing_bins = find_bins_by_time(self.session, metadata_record.subsite, metadata_record.node,
+                                          metadata_record.sensor, metadata_record.method, self.output_stream, 'cass',
+                                          lookback_first, last)
 
         # initialize the new dataframe exclude mask to exclude nothing (eg., insert all records)
         dataframe_exclude_mask = np.zeros_like(dataframe.time, dtype=bool)
 
-        delete_count = 0
-        for each in bins:
+        bin_update_count = {}
+        unchanged_count = 0
+        provenance_last_unchanged_record = None
+        existing_bin_no = -1
+        for each in existing_bins:
+            existing_bin_no += 1
+
             # fetch ALL existing data from this bin
-            current_data = fetch_bin(each.subsite, each.node, each.sensor, each.method, each.stream,
+            existing_dataframe = fetch_bin(each.subsite, each.node, each.sensor, each.method, each.stream,
                                      each.bin, cols=cols)
-            # subset data where we plan on replacing data
-            delete_mask = (current_data.time >= first_ntp) & (current_data.time <= last_ntp)
-            to_delete = current_data[delete_mask]
-            remaining = current_data[np.logical_not(delete_mask)]
+            existing_dataframe = self.prune_duplicate_times(existing_dataframe)
 
-            delete_size = to_delete.time.size
-            if delete_size:
-                first_to_delete_ntp = to_delete.time.min()
-                last_to_delete_ntp = to_delete.time.max()
+            existing_first_ntp = existing_dataframe.time.min()
+            existing_last_ntp = existing_dataframe.time.max()
 
-                # subset of new data (dataframe) that we will compare to existing data (to_delete)
-                # to see if it has changed and needs to be deleted and reinserted
-                dataframe_compare_mask = (dataframe.time >= first_to_delete_ntp)\
-                                         & (dataframe.time <= last_to_delete_ntp)
-                compare_dataframe = dataframe[dataframe_compare_mask]
-                compare_size = len(compare_dataframe)
+            log.info("full existing dataframe: bin (%d), size (%d), min (%f), max(%f)" %
+                     (each.bin, existing_dataframe.time.size, existing_first_ntp, existing_last_ntp))
 
-                # compare the old and new data in the time range where they intersect
-                # only if they have the same shape in that time range
-                if compare_size == delete_size:
-                    log.info("dataframe to_delete before data comparison: size (%d), min (%d), max(%d)",
-                             delete_size, first_to_delete_ntp, last_to_delete_ntp)
+            # If the existing data frame is a previous bin (not this bin), just get the provenance
+            df_bin_number = get_bin_number(dataframe.time.values[0], precomputed_binsize)
+            if existing_last_ntp < df_bin_number:
+                idx_last_unchanged_existing = existing_dataframe.index[-1]
+                provenance_last_unchanged_record = \
+                    (existing_dataframe.loc[idx_last_unchanged_existing, 'time'],
+                     existing_dataframe.loc[idx_last_unchanged_existing, 'provenance'])
+                log.info("previous existing bin last %f is less than df bin %d. "
+                         "using previous bin no %d to get provenance_last_unchanged_record: %s" %
+                         (existing_last_ntp, df_bin_number, existing_bin_no, str(provenance_last_unchanged_record)))
+                continue
 
-                    # mask to hold the results of the comparison of new and existing data
-                    comparison_result_mask = np.ones_like(to_delete.time, dtype=bool)
+            log.info("comparing existing bin no: %d" % existing_bin_no)
 
-                    # compare the values in each column using using numpy.isclose() with the default absolute (1e-08)
-                    # and relative (1e-05) tolerances which seem appropriate for the actual data in these streams
-                    for col in self.output_stream_derived_cols:
-                        comparison_result_mask = comparison_result_mask\
-                                               & np.isclose(to_delete[col], compare_dataframe[col], equal_nan=True)
+            intersecting_values, a_ind, b_ind = np.intersect1d(dataframe.time.values,
+                                                               existing_dataframe.time.values, return_indices=True)
 
-                    # index of all of the non-equal rows
-                    unequal_row_index = np.nonzero(np.logical_not(comparison_result_mask))[0]
-                    if unequal_row_index.size:
-                        # get the index of the first non-equal row
-                        first_unequal_row_index = unequal_row_index[0]
-                        # get the time of the first non-equal row. records in the existing and new dataframes
-                        # before this time are equal and do not need to be deleted and reinserted. These
-                        # rows of existing data can be simply be retained as they are.
-                        first_unequal_date = to_delete.time.iloc[first_unequal_row_index]
-                        log.info("current and new dataframe unequal_row_index size (%d), "
-                                 "first_unequal_row_index (%d), first_unequal_date (%d)",
-                                 unequal_row_index.size, first_unequal_row_index, first_unequal_date)
+            working_dataframe = dataframe.iloc[a_ind]
+            working_existing_dataframe = existing_dataframe.iloc[b_ind]
 
-                        # regenerate the dataframe exclude mask to exclude retained rows so that they are not
-                        # inserted again, which would create duplicate records
-                        dataframe_exclude_mask |= (dataframe.time >= to_delete.time.iloc[0])\
-                                               & (dataframe.time < first_unequal_date)
+            existing_first_ntp = working_existing_dataframe.time.min()
+            existing_last_ntp = working_existing_dataframe.time.max()
 
-                        # regenerate the delete mask to exclude retained records since we will not reinsert them
-                        # from the new dataframe
-                        delete_mask = (current_data.time >= first_unequal_date) & (current_data.time <= last_ntp)
-                    else:
-                        log.info("current and new dataframes are identical in intersecting region, "
-                                 "excluding from delete and reinsert")
-                        # regenerate the dataframe exclude mask to exclude retained records
-                        dataframe_exclude_mask |= dataframe_compare_mask
+            log.info("comparing dataframe region: size (%d), min (%f), max(%f)",
+                     len(intersecting_values), existing_first_ntp, existing_last_ntp)
 
-                        # regenerate the delete mask to exclude retained records
-                        delete_mask = np.logical_not(np.ones_like(delete_mask, dtype=bool))
+            # mask to hold the results of the comparison of new and existing data
+            comparison_result_mask = np.ones_like(working_dataframe.time, dtype=bool)
 
-                    to_delete = current_data[delete_mask]
-                    remaining = current_data[np.logical_not(delete_mask)]
+            # compare the values in each column using numpy.isclose() with the default absolute (1e-08)
+            # and relative (1e-05) tolerances which seem appropriate for the actual data in these streams
+            for col in self.output_stream_derived_cols:
+                comparison_result_mask = comparison_result_mask\
+                                        & np.isclose(working_dataframe[col],
+                                                     working_existing_dataframe[col], equal_nan=True)
 
-                    log.info("dataframe to_delete after data comparison: size (%d), size diff (%d)",
-                             len(to_delete), delete_size-len(to_delete))
+            # Exclude dataframe rows that are equal to existing rows from further processing
+            exclude_indexes = a_ind[comparison_result_mask]
+            dataframe_exclude_mask[exclude_indexes] = True
+            unchanged_count += len(exclude_indexes)
 
-                    delete_size = len(to_delete)
-                else:
-                    log.info("dataframe to_delete size (%d) and dataframe to compare size (%d) "
-                             "are different, deleting and reinserting entire intersecting region",
-                             delete_size, compare_size)
+            # Update records in the dataframe from the existing dataframe where the comparison mask is false
+            dataframe_update_to_indexes = a_ind[np.logical_not(comparison_result_mask)]
+            existing_dataframe_update_from_indexes = b_ind[np.logical_not(comparison_result_mask)]
+            # update the id's so the primary keys match and inserts will be handled as updates
+            update_ids = existing_dataframe.loc[existing_dataframe_update_from_indexes, 'id']
+            dataframe.loc[dataframe_update_to_indexes, 'id'] = update_ids.values
 
-            # If there is still something left to delete
-            if delete_size:
-                log.info("Deleting current data from %d to %d", to_delete.time.min(), to_delete.time.max())
-                # delete the existing data
-                delete_dataframe(to_delete, each)
-                # find new bin bounds and size
-                post_delete_count = remaining.time.size
-                post_delete_first = None
-                post_delete_last = None
+            bin_update_count[each.bin] = bin_update_count.setdefault(each.bin, 0) + len(dataframe_update_to_indexes)
 
-                # We can only set the min and max times if there are records remaining. If there is none,
-                # we don't need to set these since the partition_metadata will be deleted anyway
-                if post_delete_count:
-                    post_delete_first = remaining.time.min()
-                    post_delete_last = remaining.time.max()
+            log.info("comparison results for bin (%d): updates (%d), unchanged (%d)" %
+                     (each.bin, len(dataframe_update_to_indexes), len(exclude_indexes)))
 
-                    # convert times to python datetime
-                    post_delete_first = datetime.datetime.utcfromtimestamp(post_delete_first - NTP_OFFSET)
-                    post_delete_last = datetime.datetime.utcfromtimestamp(post_delete_last - NTP_OFFSET)
+            # get the provenance of the last unchanged existing record.
+            # the index of the last unchanged existing record will be
+            # one less than the index of the first changed record
+            idx_last_unchanged_existing = existing_dataframe.index[-1]
 
-                # update the partition metadata
-                set_partition(self.session, each.subsite, each.node, each.sensor, each.method, each.stream, each.store,
-                              each.bin, post_delete_first, post_delete_last, post_delete_count)
-                delete_count += delete_size
+            log.info("initializing idx_last_unchanged_existing last idx in existing_data_frame: %d" %
+                     idx_last_unchanged_existing)
 
-        # recreate the stream metadata from the aggregate partitions (if we deleted anything)
-        if delete_count:
-            recreate_stream_metadata(self.session, metadata_record.subsite, metadata_record.node,
-                                     metadata_record.sensor, metadata_record.method, self.output_stream)
+            if len(existing_dataframe_update_from_indexes) > 0:
+                idx_first_changed_existing = existing_dataframe_update_from_indexes[0]
+                log.info("idx_first_changed_existing: %d" % idx_first_changed_existing)
+                if idx_first_changed_existing > 0:
+                    idx_last_unchanged_existing = idx_first_changed_existing - 1
+                    log.info("idx_last_unchanged_existing: %d" % idx_last_unchanged_existing)
 
+            if provenance_last_unchanged_record is None or \
+               provenance_last_unchanged_record[0] < existing_dataframe.loc[idx_last_unchanged_existing, 'time']:
+                provenance_last_unchanged_record = \
+                    (existing_dataframe.loc[idx_last_unchanged_existing, 'time'],
+                     existing_dataframe.loc[idx_last_unchanged_existing, 'provenance'])
+
+        # Upsert only the records that have not been excluded.
+        # This includes new records as well as existing records that have changed
         dataframe = dataframe[np.logical_not(dataframe_exclude_mask)]
 
         final_dataframe_size = len(dataframe)
-        log.info("new dataframe after data comparison: size (%d), size diff (%d)",
-                 final_dataframe_size, orig_dataframe_size-final_dataframe_size)
+        update_count = sum(bin_update_count.values())
+        log.info("dataframe after comparison: original size (%d), new size (%d), "
+                 "update_count (%d), insert count (%d), unchanged_count (%d)",
+                 orig_dataframe_size, final_dataframe_size,
+                 update_count, final_dataframe_size-update_count, unchanged_count)
         if final_dataframe_size:
-            log.info("new dataframe after data comparison: min (%d) max(%d)",
+            log.info("new dataframe after data comparison: min(%f) max(%f)",
                      dataframe.time.min(), dataframe.time.max())
+        else:
+            log.info("data did not change in dataframe, not inserting/updating data or metadata, returning ...")
+            return
 
-        # insert our new data
+        # check the previous computed provenance to see if this computed provenance
+        # used the same set of data files and can be reused
+        previous_computed_provenance = None
+        if provenance_last_unchanged_record:
+            log.info("provenance_last_unchanged_record: %s" % str(provenance_last_unchanged_record))
+            stream_key = namedtuple('stream_key', ['subsite', 'node', 'sensor', 'method', 'stream']) \
+                (metadata_record.subsite, metadata_record.node, metadata_record.sensor,
+                 metadata_record.method, self.output_stream)
+            prev_prov_dict = fetch_l0_provenance(stream_key, [provenance_last_unchanged_record[1]], 0)
+            previous_provenance_dict = prev_prov_dict.get(str(provenance_last_unchanged_record[1]), {})
+            if previous_provenance_dict.get('filename'):
+                filename = previous_provenance_dict.get('filename')
+                previous_computed_provenance = json.loads(filename)
+
+            if previous_computed_provenance:
+                log.info("previous_computed_provenance: %s" % str(previous_computed_provenance))
+            else:
+                log.error("could not find previous_computed_provenance for stream_key %s, "
+                          "provenance_last_unchanged_record (time, provenance) %s"
+                          % (str(stream_key), str(provenance_last_unchanged_record)))
+
+        if previous_computed_provenance and \
+                previous_computed_provenance == json.loads(computed_provenance.filename):
+            log.info("reusing previous_computed_provenance as it is the same as computed_provenance")
+            computed_provenance_id = provenance_last_unchanged_record[1]
+        else:
+            log.info("inserting new computed_provenance, %s" % str(computed_provenance))
+            insert_l0_provenance(computed_provenance)
+            computed_provenance_id = computed_provenance.id
+
+        # assign provenance values to each data point
+        dataframe['provenance'] = [computed_provenance_id for _ in dataframe.time.values]
+
+        # insert our new data (inserts plus updates)
         results = insert_dataframe(metadata_record.subsite, metadata_record.node, metadata_record.sensor,
                                    metadata_record.method, self.output_stream, 0, precomputed_binsize, dataframe)
 
@@ -322,7 +368,7 @@ class BotptPrecompute(object):
             first = datetime.datetime.utcfromtimestamp(first - NTP_OFFSET)
             last = datetime.datetime.utcfromtimestamp(last - NTP_OFFSET)
 
-            count = results[bin_number]['count']
+            count = max(results[bin_number]['count'] - bin_update_count.get(bin_number, 0), 0)
             update_partition(self.session, metadata_record.subsite, metadata_record.node, metadata_record.sensor,
                              metadata_record.method, self.output_stream, store, bin_number, first, last, count)
             update_stream_metadata(self.session, metadata_record.subsite, metadata_record.node, metadata_record.sensor,
@@ -331,7 +377,7 @@ class BotptPrecompute(object):
     def get_predicted_tide(self, min_time, max_time, metadata_record):
         min_dt = datetime.datetime.utcfromtimestamp(min_time - NTP_OFFSET)
         max_dt = datetime.datetime.utcfromtimestamp(max_time - NTP_OFFSET)
-        arg_str = '%s, %s, %s, %s, %s, %s, %s (%d), %s (%d)' % \
+        arg_str = '%s, %s, %s, %s, %s, %s, %s (%f), %s (%f)' % \
                   (metadata_record.subsite, metadata_record.node, metadata_record.sensor,
                    metadata_record.method, PRED_TIDE_STREAM, metadata_record.store,
                    min_dt, min_time, max_dt, max_time)
@@ -391,7 +437,7 @@ class BotptPrecompute15s(BotptPrecompute):
             return make_15s(dataframe, pred_tide_dataframe)
         except ValueError as e:
             log.error("ValueError caught from make_15s: " 
-                      "dataframe-%s(min: %s (%d), max: %s (%d)), dataframe-%s(min: %s (%d), max: %s (%d))",
+                      "dataframe-%s(min: %s (%f), max: %s (%f)), dataframe-%s(min: %s (%f), max: %s (%f))",
                       metadata_record.stream,
                       ntp_to_datetime(dataframe.time.min()), dataframe.time.min(),
                       ntp_to_datetime(dataframe.time.max()), dataframe.time.max(),
@@ -424,7 +470,7 @@ class BotptPrecompute24h(BotptPrecompute):
             return make_24h(dataframe)
         except ValueError as e:
             log.error("ValueError caught from make_24h: " 
-                      "dataframe-%s(min: %s (%d), max: %s (%d))",
+                      "dataframe-%s(min: %s (%f), max: %s (%f))",
                       metadata_record.stream,
                       ntp_to_datetime(dataframe.time.min()), dataframe.time.min(),
                       ntp_to_datetime(dataframe.time.max()), dataframe.time.max())
